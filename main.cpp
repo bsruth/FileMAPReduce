@@ -145,14 +145,6 @@ std::vector<Transition> GetTransitionsFromDAT(const fs::path& filePath, int chan
 }
 
 
-Sample MapValueToSample(int16_t* buffer, int channelToMap, uint64_t timestamp) 
-{
-	Sample s;
-	s.timestamp = timestamp;
-	s.value = buffer[channelToMap];
-	return s;
-}
-
 class SampleGenerator {
 public:
 	SampleGenerator(FILE* file, int channelIndex, int numChannels, double timePerSample)
@@ -212,6 +204,65 @@ private:
 	int samplesProcessed;
 };
 
+class TransitionFinder {
+public:
+	TransitionFinder(SampleGenerator sGen_)
+		: foundInflection(false)
+		, foundPeak(false)
+		, sGen(sGen_)
+	{
+		prev = sGen.GetNextSample();
+	}
+	~TransitionFinder() {}
+
+	Transition GetNextTransition() {
+		Transition nextTransition;
+		nextTransition.timestamp = InvalidTS;
+		auto current = sGen.GetNextSample();
+		while (current.timestamp != InvalidTS && nextTransition.timestamp == InvalidTS) {
+			if (foundInflection == false) {
+				foundInflection = IsInflection(prev, current);
+			}
+			else if (foundPeak == false) {
+				foundPeak = IsPeak(prev, current);
+			}
+
+			if (foundInflection && foundPeak) {
+				bool on = prev.value > 0;
+				nextTransition.file = "DAT";
+				nextTransition.on = on;
+				nextTransition.timestamp = prev.timestamp;
+				nextTransition.frameNumber = 0;
+				foundInflection = false;
+				foundPeak = false;
+				prev = current;
+
+			}
+			else {
+				prev = std::exchange(current, sGen.GetNextSample());
+			}
+		}
+
+		return nextTransition;
+	}
+
+private:
+
+	bool IsPeak(const Sample& prev, const Sample& next) {
+		return (prev.value > 0 && prev.value > next.value)
+			|| (prev.value < 0 && prev.value < next.value);
+	};
+
+	bool IsInflection (const Sample& prev, const Sample& next) {
+		auto lowToHigh = (prev.value <= 0) && (next.value > 0);
+		auto highToLow = (prev.value >= 0) && (next.value < 0);
+		return  lowToHigh || highToLow;
+	};
+	bool foundInflection;
+	bool foundPeak;
+	SampleGenerator sGen;
+	Sample prev;
+};
 std::vector<Sample> GetSamplesFromDAT2(const fs::path& filePath, int channelIndex, int numChannels, double timePerSample) {
 	if (fs::exists(filePath) == false) {
 		return std::vector<Sample>();
@@ -239,18 +290,6 @@ std::vector<Transition> GetTransitionsFromDAT2(const fs::path& filePath, int cha
 		return std::vector<Transition>();
 	}
 
-	auto peakPred = [](const auto& prev, const auto& next) {
-		return (prev.value > 0 && prev.value > next.value)
-			|| (prev.value < 0 && prev.value < next.value);
-	};
-
-	auto findInflect = [](const auto& prev, const auto& next) {
-
-		auto lowToHigh = (prev.value <= 0) && (next.value > 0);
-		auto highToLow = (prev.value >= 0) && (next.value < 0);
-		return  lowToHigh || highToLow;
-	};
-
 	std::vector<Transition> transitions;
 	std::vector<Sample> samples;
 	FILE* layFile = nullptr;
@@ -258,31 +297,12 @@ std::vector<Transition> GetTransitionsFromDAT2(const fs::path& filePath, int cha
 	
 	SampleGenerator sGen(layFile, channelIndex, numChannels, timePerSample);
 
-	Sample current = sGen.GetNextSample();
-	Sample prev = current;
-	bool foundInflection = false;
-	bool foundPeak = false;
-	while (current.timestamp != InvalidTS) {
-			if (foundInflection == false) {
-				foundInflection = findInflect(prev, current);
-			}
-			else if (foundPeak == false) {
-				foundPeak = peakPred(prev, current);
-			}
+	TransitionFinder tF(sGen);
 
-			if (foundInflection && foundPeak) {
-				Transition transition;
-				bool on = prev.value > 0;
-				transition.file = "DAT";
-				transition.on = on;
-				transition.timestamp = prev.timestamp;
-				transition.frameNumber = 0;
-				transitions.emplace_back(transition);
-				foundInflection = false;
-				foundPeak = false;
-			}
-
-			prev = std::exchange(current, sGen.GetNextSample());
+	auto transition = tF.GetNextTransition();
+	while (transition.timestamp != InvalidTS) {
+		transitions.emplace_back(transition);
+		transition = tF.GetNextTransition();
 	}
 
 	fclose(layFile);
@@ -295,9 +315,15 @@ void main()
 	auto samplingFreq = 32000;
 	auto timePerSample(1.0 / samplingFreq * std::micro::den);
 	auto channelsInLay = 64;
+	auto startTime = std::chrono::steady_clock::now();
 	auto datTransitions = GetTransitionsFromDAT(DATPath, 0, channelsInLay, timePerSample);
+	auto execTime = std::chrono::steady_clock::now() - startTime;
+	cout << " Old way took: " << std::chrono::duration_cast<std::chrono::microseconds>(execTime).count() << " us" << endl;
 
+	startTime = std::chrono::steady_clock::now();
 	auto datTransitions2 = GetTransitionsFromDAT2(DATPath, 0, channelsInLay, timePerSample);
+	execTime = std::chrono::steady_clock::now() - startTime;
+	cout << " New way took: " << std::chrono::duration_cast<std::chrono::microseconds>(execTime).count() << " us" << endl;
 
 
 	auto mismatched = std::mismatch(begin(datTransitions), end(datTransitions), begin(datTransitions2), end(datTransitions2), [](const auto& lhs, const auto& rhs) {
@@ -311,7 +337,7 @@ void main()
 	});
 
 	std::cout << (mismatched.first == end(datTransitions) ? "Values equal" : "NOPE") << endl;
-#ifdef _DEBUG
+//#ifdef _DEBUG
 	system("pause");
-#endif
+//#endif
 }
